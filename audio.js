@@ -1,22 +1,16 @@
-// audio.js — controle de música de fundo e efeitos simples
-
+// audio.js — música de fundo (isolado, não interfere no jogo)
 let bgm = null;
-let volume = 0.4;
 
 export function initMusic(src = "./assets/music.mp3", vol = 0.4) {
-  if (bgm) {
-    bgm.pause();
-    bgm = null;
-  }
+  if (bgm) return;
   bgm = new Audio(src);
   bgm.loop = true;
-  volume = vol;
-  bgm.volume = volume;
+  bgm.volume = vol;
 }
 
 export function playMusic() {
   if (!bgm) return;
-  bgm.play().catch(()=>{});
+  bgm.play().catch(() => {});
 }
 
 export function stopMusic() {
@@ -26,6 +20,6 @@ export function stopMusic() {
 }
 
 export function setVolume(v) {
-  volume = Number(v) || 0;
-  if (bgm) bgm.volume = volume;
+  if (!bgm) return;
+  bgm.volume = Number(v) || 0;
 }
