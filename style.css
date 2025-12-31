@@ -7,7 +7,9 @@ body{
 }
 
 canvas{
-  display:none;
+  display:block;
+  width:100%;
+  height:100%;
 }
 
 #titleScreen{
@@ -46,3 +48,8 @@ canvas{
 #left{left:20px;}
 #right{left:110px;}
 #jump{right:20px;}
+/* Adicionais visuais para chat/admin/config */
+#configScreen { z-index:60; }
+#adminModal { z-index:80; }
+#game { z-index:10; }
+#fireBtn { z-index:30; }
