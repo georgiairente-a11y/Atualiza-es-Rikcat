@@ -1,31 +1,105 @@
-// game.js — PC + Mobile + Multiplayer (corrigido)
+// game.js — CORRIGIDO: colisão com chão e desenho do mapa (PC + Mobile + Multiplayer básico)
 import { db, ref, set, push, onValue, onDisconnect } from "./firebase.js";
 import { drawRikcat } from "./rikcat.js";
-import { initMusic, playMusic, setVolume } from "./audio.js";
-import { tryPassword, isAdmin, wireEffectsRef, effects, spawnEffect } from "./admin.js";
+import { wireEffectsRef, spawnEffect } from "./admin.js"; // se admin não exportar, remova a importação
 
+// canvas setup
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 
 function fitCanvas() {
-  canvas.width = innerWidth;
-  canvas.height = innerHeight;
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
 }
 fitCanvas();
 window.addEventListener("resize", fitCanvas);
 
-const isPC = !/Android|iPhone|iPad/i.test(navigator.userAgent);
+// basic platform settings
+const GROUND_HEIGHT = 40; // altura do "chão" em px (visual)
+const GRAVITY = 0.6;
+const MOVE_SPEED = 3;
+const JUMP_V = -10;
 
+// detect platform (hide mobile buttons on PC)
+const isPC = !/Android|iPhone|iPad/i.test(navigator.userAgent);
 if (isPC) {
   document.querySelectorAll(".btn").forEach(b => b.style.display = "none");
 }
 
-let camX = 0;
-const room = "global";
-const playerId = Math.random().toString(36).slice(2);
+// room / player id
+const ROOM = "global";
+const PLAYER_ID = Math.random().toString(36).slice(2);
 
-let localPlayers = {}; // store from DB
+// local state
+let dbPlayers = {}; // players read from DB
+let effects = []; // optional, will be populated by admin module if available
 
+// player defaults (p.y is TOP coordinate — important for collision math)
+const player = {
+  x: 100,
+  // start on ground properly (top coordinate = canvas.height - ground - halfHeight)
+  y: (canvas.height || window.innerHeight) - GROUND_HEIGHT - 16, // h/2 = 16
+  w: 32,
+  h: 32,
+  vx: 0,
+  vy: 0,
+  onGround: true,
+  facing: 1,
+  nick: "Player",
+  color: "#FFB000"
+};
+
+// Firebase refs
+const playerRef = ref(db, `rooms/${ROOM}/players/${PLAYER_ID}`);
+const playersRef = ref(db, `rooms/${ROOM}/players`);
+const effectsRef = ref(db, `rooms/${ROOM}/effects`);
+const chatRef = ref(db, `rooms/${ROOM}/chat`);
+
+// wire admin effects if function exists
+try {
+  wireEffectsRef && wireEffectsRef(effectsRef);
+} catch (err) {
+  // ignore if admin module not present or wireEffectsRef undefined
+}
+
+// write initial presence and ensure removal on disconnect
+set(playerRef, sanitizeForDB(player));
+try { onDisconnect(playerRef).remove(); } catch (e) { /* ignore in environments without onDisconnect */ }
+
+// listen to other players
+onValue(playersRef, snap => {
+  dbPlayers = snap.val() || {};
+});
+
+// --- CHAT (minimal) ---
+const chatBox = document.getElementById("chatBox");
+const chatInput = document.getElementById("chatInput");
+if (chatBox && chatInput) {
+  onValue(chatRef, snap => {
+    const val = snap.val() || {};
+    chatBox.innerHTML = "";
+    Object.values(val).forEach(m => {
+      const nick = escapeHtml(m.nick || "Anon");
+      const text = escapeHtml(m.text || "");
+      chatBox.innerHTML += `<div><b>${nick}:</b> ${text}</div>`;
+    });
+    chatBox.scrollTop = chatBox.scrollHeight;
+  });
+
+  chatInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" && chatInput.value.trim()) {
+      push(chatRef, { nick: player.nick, text: chatInput.value });
+      chatInput.value = "";
+    }
+  });
+}
+
+// simple escape helper
+function escapeHtml(str) {
+  return String(str || "").replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+}
+
+// --- Controls ---
 const keys = {};
 window.addEventListener("keydown", e => {
   keys[e.key.toLowerCase()] = true;
@@ -34,140 +108,92 @@ window.addEventListener("keyup", e => {
   keys[e.key.toLowerCase()] = false;
 });
 
-// player default
-const player = {
-  x: 100,
-  y: 0,
-  w: 32,
-  h: 32,
-  vx: 0,
-  vy: 0,
-  onGround: false,
-  facing: 1,
-  nick: "Player",
-  color: "#FFB000"
-};
-
-// Firebase refs
-const playerRef = ref(db, `rooms/${room}/players/${playerId}`);
-const playersRef = ref(db, `rooms/${room}/players`);
-const effectsRef = ref(db, `rooms/${room}/effects`);
-const chatRef = ref(db, `rooms/${room}/chat`);
-
-wireEffectsRef(effectsRef);
-
-// write initial player (will be updated continuously)
-set(playerRef, player);
-onDisconnect(playerRef).remove();
-
-// read players
-onValue(playersRef, snap => {
-  localPlayers = snap.val() || {};
-});
-
-// read chat
-const chatBox = document.getElementById("chatBox");
-const chatInput = document.getElementById("chatInput");
-onValue(chatRef, snap => {
-  const val = snap.val() || {};
-  chatBox.innerHTML = "";
-  Object.values(val).forEach(m => {
-    chatBox.innerHTML += `<div><b>${escapeHtml(m.nick)}:</b> ${escapeHtml(m.text)}</div>`;
-  });
-  if (chatBox) chatBox.scrollTop = chatBox.scrollHeight;
-});
-
-function escapeHtml(text) {
-  return String(text || "").replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
-}
-
-chatInput && chatInput.addEventListener("keydown", e => {
-  if (e.key === "Enter" && chatInput.value.trim()) {
-    push(chatRef, { nick: player.nick, text: chatInput.value });
-    chatInput.value = "";
-  }
-});
-
-// control handling
-function handleKeyboard() {
+function handleKeyboardControls() {
   if (keys["a"] || keys["arrowleft"]) {
-    player.vx = -3;
+    player.vx = -MOVE_SPEED;
     player.facing = -1;
   } else if (keys["d"] || keys["arrowright"]) {
-    player.vx = 3;
+    player.vx = MOVE_SPEED;
     player.facing = 1;
   } else {
     player.vx = 0;
   }
 
   if ((keys["w"] || keys["arrowup"] || keys[" "]) && player.onGround) {
-    player.vy = -10;
+    player.vy = JUMP_V;
     player.onGround = false;
   }
 }
 
-// mobile/touch controls
+// mobile controls (pointer events — works for mouse + touch)
 const leftBtn = document.getElementById("left");
 const rightBtn = document.getElementById("right");
 const jumpBtn = document.getElementById("jump");
 
 if (leftBtn) {
-  leftBtn.addEventListener("pointerdown", (e) => { player.vx = -3; player.facing = -1; e.preventDefault(); });
+  leftBtn.addEventListener("pointerdown", e => { player.vx = -MOVE_SPEED; player.facing = -1; e.preventDefault(); });
   leftBtn.addEventListener("pointerup", () => { player.vx = 0; });
   leftBtn.addEventListener("pointercancel", () => { player.vx = 0; });
 }
 if (rightBtn) {
-  rightBtn.addEventListener("pointerdown", (e) => { player.vx = 3; player.facing = 1; e.preventDefault(); });
+  rightBtn.addEventListener("pointerdown", e => { player.vx = MOVE_SPEED; player.facing = 1; e.preventDefault(); });
   rightBtn.addEventListener("pointerup", () => { player.vx = 0; });
   rightBtn.addEventListener("pointercancel", () => { player.vx = 0; });
 }
 if (jumpBtn) {
   jumpBtn.addEventListener("pointerdown", () => {
     if (player.onGround) {
-      player.vy = -10;
+      player.vy = JUMP_V;
       player.onGround = false;
     }
   });
 }
 
-// physics
-function physics() {
-  player.vy += 0.5; // gravity
+// optional: fire button (admin)
+const fireBtn = document.getElementById("fireBtn");
+if (fireBtn) {
+  fireBtn.addEventListener("click", () => {
+    try {
+      spawnEffect && spawnEffect(player.x, player.y + (player.h/2), player.facing);
+    } catch (err) { /* ignore */ }
+  });
+}
 
+// --- Physics & Collision ---
+// Note: drawRikcat expects p.y to be TOP coordinate. To keep things consistent:
+// - ground top for player's TOP coordinate should be: canvas.height - GROUND_HEIGHT - (player.h / 2)
+//   because drawRikcat renders using p.y + (p.h/2) as center Y.
+
+function physicsStep() {
+  // gravity
+  player.vy += GRAVITY;
+
+  // movement
   player.x += player.vx;
   player.y += player.vy;
 
-  const groundY = canvas.height - 40;
-  if (player.y >= groundY) {
-    player.y = groundY;
+  // ground collision (we compute top coordinate that places center on ground)
+  const groundCenterY = canvas.height - GROUND_HEIGHT; // y of the very top of ground (visual)
+  const playerTopMax = groundCenterY - (player.h / 2); // maximum top coordinate allowed
+
+  if (player.y > playerTopMax) {
+    player.y = playerTopMax;
     player.vy = 0;
     player.onGround = true;
   } else {
     player.onGround = false;
   }
 
-  camX = player.x - canvas.width / 2;
+  // simple world bounds on X (keep player inside a wide world)
+  if (player.x < 0) player.x = 0;
+  // arbitrary right bound (can be large)
+  if (player.x > 10000) player.x = 10000;
 }
 
-// update -> write to firebase
-function update() {
-  if (isPC) handleKeyboard();
-  physics();
-  // update player data to DB (minimal set)
-  const toSend = {
-    x: player.x,
-    y: player.y,
-    vx: player.vx,
-    vy: player.vy,
-    onGround: player.onGround,
-    facing: player.facing,
-    nick: player.nick,
-    color: player.color,
-    w: player.w,
-    h: player.h,
-    updatedAt: Date.now()
-  };
-  set(playerRef, toSend);
+// --- Drawing ---
+let camX = 0;
+function updateCamera() {
+  camX = player.x - canvas.width / 2;
 }
 
 function drawBackground() {
@@ -175,69 +201,135 @@ function drawBackground() {
   ctx.fillStyle = "#6aa5ff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // ground (long rect)
+  // distant hills / decoration (simple)
+  const hillsY = canvas.height - GROUND_HEIGHT - 40;
+  ctx.fillStyle = "#4ea357";
+  for (let i = -2000; i < 10000; i += 300) {
+    const hx = i - camX;
+    ctx.beginPath();
+    ctx.ellipse(hx + 150, hillsY + 30, 120, 60, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ground (long rectangle)
   ctx.fillStyle = "#3cb371";
-  ctx.fillRect(-camX - 1000, canvas.height - 40, 10000, 40);
+  // draw far more width than screen to avoid gaps while camera moves
+  ctx.fillRect(-camX - 2000, canvas.height - GROUND_HEIGHT, 20000, GROUND_HEIGHT);
+
+  // optional: simple grid or platform lines on ground
+  ctx.strokeStyle = "rgba(0,0,0,0.05)";
+  ctx.lineWidth = 1;
+  for (let gx = -2000; gx < 10000; gx += 64) {
+    const sx = gx - camX;
+    ctx.beginPath();
+    ctx.moveTo(sx, canvas.height - GROUND_HEIGHT);
+    ctx.lineTo(sx, canvas.height - GROUND_HEIGHT + 6);
+    ctx.stroke();
+  }
 }
 
-function draw() {
+function drawAllPlayers() {
+  // draw every player from DB (including ourselves as stored)
+  Object.entries(dbPlayers).forEach(([id, pRaw]) => {
+    // normalize fields (DB may have different shape)
+    const p = {
+      x: Number(pRaw.x || 0),
+      y: Number(pRaw.y || 0),
+      vx: Number(pRaw.vx || 0),
+      vy: Number(pRaw.vy || 0),
+      onGround: !!pRaw.onGround,
+      facing: (typeof pRaw.facing === "number") ? pRaw.facing : (pRaw.facing === "-1" ? -1 : 1),
+      nick: pRaw.nick || "Player",
+      color: pRaw.color || "#FFB000",
+      w: Number(pRaw.w || 32),
+      h: Number(pRaw.h || 32)
+    };
+    drawRikcat(ctx, p, camX);
+  });
+
+  // if our local player isn't yet in DBPlayers (rare), draw local
+  if (!dbPlayers[PLAYER_ID]) {
+    drawRikcat(ctx, player, camX);
+  }
+}
+
+function drawEffects() {
+  // if admin module pushed effects into DB and wireEffectsRef populated them,
+  // they should be available from 'effects' variable (admin module handles update).
+  try {
+    effects.forEach(e => {
+      ctx.strokeStyle = "orange";
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(e.x - camX, e.y);
+      ctx.lineTo(e.x - camX + (e.dir || 1) * (e.len || 400), e.y);
+      ctx.stroke();
+    });
+  } catch (err) {
+    // nothing — effects optional
+  }
+}
+
+function render() {
+  // clear + draw background
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawBackground();
 
-  // draw other players (and ourselves)
-  Object.entries(localPlayers).forEach(([id, p]) => {
-    // p may be plain object from DB - ensure defaults
-    const px = {
-      x: p.x || 0,
-      y: p.y || 0,
-      vx: p.vx || 0,
-      vy: p.vy || 0,
-      onGround: !!p.onGround,
-      facing: (typeof p.facing === "number") ? p.facing : 1,
-      nick: p.nick || "Player",
-      color: p.color || "#FFB000",
-      w: p.w || 32,
-      h: p.h || 32
-    };
-    drawRikcat(ctx, px, camX);
-  });
+  // players
+  drawAllPlayers();
 
-  // draw effects (from admin module)
-  effects.forEach(e => {
-    ctx.strokeStyle = "orange";
-    ctx.lineWidth = 6;
-    ctx.beginPath();
-    ctx.moveTo(e.x - camX, e.y);
-    ctx.lineTo(e.x - camX + e.dir * (e.len || 400), e.y);
-    ctx.stroke();
-  });
+  // effects
+  drawEffects();
+}
+
+// --- Update loop ---
+function sanitizeForDB(obj) {
+  // remove functions and keep only primitives
+  return {
+    x: Number(obj.x || 0),
+    y: Number(obj.y || 0),
+    vx: Number(obj.vx || 0),
+    vy: Number(obj.vy || 0),
+    onGround: !!obj.onGround,
+    facing: Number(obj.facing || 1),
+    nick: obj.nick || "Player",
+    color: obj.color || "#FFB000",
+    w: Number(obj.w || 32),
+    h: Number(obj.h || 32),
+    updatedAt: Date.now()
+  };
+}
+
+function update() {
+  // controls
+  if (isPC) handleKeyboardControls();
+
+  // physics
+  physicsStep();
+
+  // camera
+  updateCamera();
+
+  // write to DB (minimal)
+  try {
+    set(playerRef, sanitizeForDB(player));
+  } catch (err) {
+    // ignore DB write errors in offline dev
+  }
 }
 
 function loop() {
   update();
-  draw();
+  render();
   requestAnimationFrame(loop);
 }
-loop();
+requestAnimationFrame(loop);
 
-// title screen buttons (play music after interaction)
+// --- Basic title/config wiring (non-invasive) ---
+const titleScreen = document.getElementById("titleScreen");
 const soloBtn = document.getElementById("soloBtn");
 const multiBtn = document.getElementById("multiBtn");
-const titleScreen = document.getElementById("titleScreen");
-const gameScreen = document.getElementById("game");
-
-function enterGame() {
-  // init music and play (will only start after user interaction)
-  initMusic("./assets/music.mp3", 0.4);
-  playMusic();
-
-  titleScreen.style.display = "none";
-  gameScreen.style.display = "block";
-}
-if (soloBtn) soloBtn.onclick = enterGame;
-if (multiBtn) multiBtn.onclick = enterGame;
-
-// CONFIG UI
+const gameDiv = document.getElementById("game");
 const configBtn = document.getElementById("configBtn");
 const configScreen = document.getElementById("configScreen");
 const closeConfig = document.getElementById("closeConfig");
@@ -245,58 +337,31 @@ const nickInput = document.getElementById("nickInput");
 const colorSelect = document.getElementById("colorSelect");
 const skinSelect = document.getElementById("skinSelect");
 
-configBtn && (configBtn.onclick = () => {
-  // populate inputs with current values
-  nickInput.value = player.nick;
-  colorSelect.value = player.color || "#FFB000";
-  skinSelect.value = player.skin || "rikcat";
+function enterGameScreen() {
+  if (titleScreen) titleScreen.style.display = "none";
+  if (gameDiv) gameDiv.style.display = "block";
+}
+
+// attach but do not override existing game code if present
+if (soloBtn) soloBtn.addEventListener("click", enterGameScreen);
+if (multiBtn) multiBtn.addEventListener("click", enterGameScreen);
+
+// config open/close (if elements exist)
+if (configBtn) configBtn.addEventListener("click", () => {
+  if (!configScreen) return;
+  // populate values
+  if (nickInput) nickInput.value = player.nick;
+  if (colorSelect) colorSelect.value = player.color || "#FFB000";
+  if (skinSelect) skinSelect.value = player.skin || "rikcat";
   configScreen.style.display = "flex";
 });
-closeConfig && (closeConfig.onclick = () => {
-  // save changes locally and to DB
-  player.nick = nickInput.value.trim() || player.nick;
-  player.color = colorSelect.value || player.color;
-  player.skin = skinSelect.value || player.skin;
-  set(playerRef, {
-    x: player.x, y: player.y, vx: player.vx, vy: player.vy,
-    onGround: player.onGround, facing: player.facing,
-    nick: player.nick, color: player.color, w: player.w, h: player.h
-  });
-  configScreen.style.display = "none";
+if (closeConfig) closeConfig.addEventListener("click", () => {
+  if (nickInput) player.nick = nickInput.value.trim() || player.nick;
+  if (colorSelect) player.color = colorSelect.value || player.color;
+  if (skinSelect) player.skin = skinSelect.value || player.skin;
+  try { set(playerRef, sanitizeForDB(player)); } catch(e){}
+  if (configScreen) configScreen.style.display = "none";
 });
 
-// ADMIN modal wiring
-const adminBtn = document.getElementById("adminBtn");
-const adminModal = document.getElementById("adminModal");
-const adminSubmit = document.getElementById("adminSubmit");
-const adminCancel = document.getElementById("adminCancel");
-const adminPass = document.getElementById("adminPass");
-const fireBtn = document.getElementById("fireBtn");
-
-adminBtn && (adminBtn.onclick = () => { adminModal.style.display = "flex"; });
-adminCancel && (adminCancel.onclick = () => { adminModal.style.display = "none"; adminPass.value = ""; });
-adminSubmit && (adminSubmit.onclick = () => {
-  const pass = adminPass.value || "";
-  if (tryPassword(pass)) {
-    adminModal.style.display = "none";
-    adminPass.value = "";
-    // show fire button if any
-    if (fireBtn) fireBtn.style.display = "block";
-    alert("Modo ADM ativado");
-  } else {
-    alert("Senha incorreta");
-  }
-});
-
-// Fire effect button
-fireBtn && (fireBtn.onclick = () => {
-  spawnEffect(player.x, player.y + 10, player.facing);
-});
-
-// allow clicking anywhere to focus (helpful for keyboard)
-window.addEventListener("pointerdown", () => { /* noop to allow audio on first interaction if needed */ });
-
-// small helper: show/hide mobile controls on PC
-if (isPC) {
-  document.querySelectorAll(".btn").forEach(b => b.style.display = "none");
-}
+// make first pointer event unlock audio on some browsers (no-op safe)
+window.addEventListener("pointerdown", () => {}, { once: true });
